@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 )
@@ -213,7 +215,81 @@ func usageError(message string) error {
 }
 
 func createSnapshot(root string, excludes []string) (*SnapshotFile, error) {
-	return nil, errors.New("create is not implemented yet")
+	start := time.Now()
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve absolute root path: %w", err)
+	}
+
+	hostname, err := os.Hostname()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get hostname: %w", err)
+	}
+
+	excludeSet := make(map[string]struct{}, len(excludes))
+	for _, exclude := range excludes {
+		excludeSet[exclude] = struct{}{}
+	}
+
+	snapshot := newBaseSnapshot()
+	snapshot.System.Hostname = hostname
+	snapshot.Options.Excluded = append([]string(nil), excludes...)
+	snapshot.Snapshot.CreatedUTC = start.UTC()
+	snapshot.Snapshot.RootPath = absRoot
+	snapshot.Snapshot.PathStyle = "slash"
+
+	if err := filepath.WalkDir(absRoot, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == absRoot {
+			return nil
+		}
+
+		relPath, err := relativeSlashPath(absRoot, path)
+		if err != nil {
+			return fmt.Errorf("failed to derive relative path for %s: %w", path, err)
+		}
+
+		if shouldExclude(relPath, excludeSet) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return fmt.Errorf("failed to read file info for %s: %w", path, err)
+		}
+
+		entry := entryFromInfo(relPath, info)
+		snapshot.Entries = append(snapshot.Entries, entry)
+
+		switch entry.Type {
+		case "file":
+			snapshot.Snapshot.FileCount++
+			snapshot.Snapshot.TotalFileSizeBytes += entry.SizeBytes
+		case "directory":
+			snapshot.Snapshot.DirectoryCount++
+		case "symlink":
+			snapshot.Snapshot.SymlinkCount++
+		default:
+			snapshot.Snapshot.OtherCount++
+		}
+
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("failed to walk root path %s: %w", root, err)
+	}
+
+	sort.Slice(snapshot.Entries, func(i, j int) bool {
+		return snapshot.Entries[i].Path < snapshot.Entries[j].Path
+	})
+
+	snapshot.Snapshot.EntryCount = len(snapshot.Entries)
+	snapshot.Snapshot.DurationMs = time.Since(start).Milliseconds()
+	return &snapshot, nil
 }
 
 func writeSnapshot(path string, snapshot *SnapshotFile) error {
@@ -235,11 +311,69 @@ func writeSnapshot(path string, snapshot *SnapshotFile) error {
 }
 
 func readSnapshot(path string) (*SnapshotFile, error) {
-	return nil, errors.New("diff is not implemented yet")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read snapshot: %s", path)
+	}
+
+	var snapshot SnapshotFile
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return nil, fmt.Errorf("invalid snapshot JSON: %s", path)
+	}
+
+	if err := validateSnapshot(&snapshot); err != nil {
+		return nil, err
+	}
+
+	return &snapshot, nil
 }
 
 func diffSnapshots(before, after *SnapshotFile) DiffResult {
-	return DiffResult{}
+	beforeIndex := make(map[string]Entry, len(before.Entries))
+	for _, entry := range before.Entries {
+		beforeIndex[entry.Path] = entry
+	}
+
+	afterIndex := make(map[string]Entry, len(after.Entries))
+	for _, entry := range after.Entries {
+		afterIndex[entry.Path] = entry
+	}
+
+	result := DiffResult{}
+
+	for path, afterEntry := range afterIndex {
+		beforeEntry, ok := beforeIndex[path]
+		if !ok {
+			result.Added = append(result.Added, afterEntry)
+			continue
+		}
+
+		changes := diffEntryFields(beforeEntry, afterEntry)
+		if len(changes) > 0 {
+			result.Modified = append(result.Modified, ModifiedEntry{
+				Path:    path,
+				Changes: changes,
+			})
+		}
+	}
+
+	for path, beforeEntry := range beforeIndex {
+		if _, ok := afterIndex[path]; !ok {
+			result.Deleted = append(result.Deleted, beforeEntry)
+		}
+	}
+
+	sort.Slice(result.Added, func(i, j int) bool {
+		return result.Added[i].Path < result.Added[j].Path
+	})
+	sort.Slice(result.Deleted, func(i, j int) bool {
+		return result.Deleted[i].Path < result.Deleted[j].Path
+	})
+	sort.Slice(result.Modified, func(i, j int) bool {
+		return result.Modified[i].Path < result.Modified[j].Path
+	})
+
+	return result
 }
 
 func printDiff(result DiffResult) {
@@ -247,6 +381,21 @@ func printDiff(result DiffResult) {
 	fmt.Printf("  Added:    %d\n", len(result.Added))
 	fmt.Printf("  Deleted:  %d\n", len(result.Deleted))
 	fmt.Printf("  Modified: %d\n", len(result.Modified))
+
+	printEntryList("Added", result.Added)
+	printEntryList("Deleted", result.Deleted)
+
+	if len(result.Modified) > 0 {
+		fmt.Println()
+		fmt.Println("Modified:")
+		for _, modified := range result.Modified {
+			fmt.Printf("  %s\n", modified.Path)
+			for _, change := range modified.Changes {
+				fmt.Printf("    %s: %s -> %s\n", change.Field, change.Before, change.After)
+			}
+			fmt.Println()
+		}
+	}
 }
 
 func relativeSlashPath(root string, fullPath string) (string, error) {
@@ -309,5 +458,77 @@ func newBaseSnapshot() SnapshotFile {
 			Hash:               false,
 		},
 		Entries: []Entry{},
+	}
+}
+
+func validateSnapshot(snapshot *SnapshotFile) error {
+	if snapshot.SchemaVersion != schemaVersion {
+		return fmt.Errorf("invalid snapshot schema version: %d", snapshot.SchemaVersion)
+	}
+	if snapshot.Entries == nil {
+		return errors.New("snapshot entries must not be nil")
+	}
+
+	seen := make(map[string]struct{}, len(snapshot.Entries))
+	for _, entry := range snapshot.Entries {
+		if _, exists := seen[entry.Path]; exists {
+			return fmt.Errorf("duplicate entry path in snapshot: %s", entry.Path)
+		}
+		seen[entry.Path] = struct{}{}
+	}
+
+	return nil
+}
+
+func diffEntryFields(before, after Entry) []FieldChange {
+	fields := []struct {
+		name   string
+		before string
+		after  string
+	}{
+		{name: "type", before: before.Type, after: after.Type},
+		{name: "sizeBytes", before: fmt.Sprintf("%d", before.SizeBytes), after: fmt.Sprintf("%d", after.SizeBytes)},
+		{name: "createdUtc", before: formatOptionalTime(before.CreatedUTC), after: formatOptionalTime(after.CreatedUTC)},
+		{name: "modifiedUtc", before: before.ModifiedUTC.UTC().Format(time.RFC3339), after: after.ModifiedUTC.UTC().Format(time.RFC3339)},
+		{name: "permissions", before: formatOptionalString(before.Permissions), after: formatOptionalString(after.Permissions)},
+	}
+
+	changes := make([]FieldChange, 0, len(fields))
+	for _, field := range fields {
+		if field.before == field.after {
+			continue
+		}
+		changes = append(changes, FieldChange{
+			Field:  field.name,
+			Before: field.before,
+			After:  field.after,
+		})
+	}
+	return changes
+}
+
+func formatOptionalTime(t *time.Time) string {
+	if t == nil {
+		return "null"
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
+func formatOptionalString(s *string) string {
+	if s == nil {
+		return "null"
+	}
+	return *s
+}
+
+func printEntryList(name string, entries []Entry) {
+	if len(entries) == 0 {
+		return
+	}
+
+	fmt.Println()
+	fmt.Println(name + ":")
+	for _, entry := range entries {
+		fmt.Printf("  %s\n", entry.Path)
 	}
 }
