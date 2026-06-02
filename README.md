@@ -2,22 +2,14 @@
 
 `foldersnap` is a simple Go CLI that snapshots folder metadata to JSON and compares two snapshots to show what changed.
 
-Version `0.1.0` is intentionally simple:
-
-- standard library only
-- JSON snapshot format
-- no file hashing
-- no file content diff
-- no `.gitignore` parsing
-
-The snapshot records lightweight metadata only:
+Current Version is intentionally simple. The snapshot records lightweight metadata only:
 
 - relative path
 - entry type
 - size in bytes
 - created time in UTC, when available
 - modified time in UTC
-- permissions
+- permissions (if applicable)
 
 ## Build
 
@@ -84,8 +76,3 @@ Modified:
   deploy.sh
     permissions: 0644 -> 0755
 ```
-
-## Notes
-
-- Hashing is not supported in version `0.1.0`.
-- `createdUtc` may be `null`, especially on Linux and other unsupported platforms.
