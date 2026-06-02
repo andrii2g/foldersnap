@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -274,6 +275,30 @@ func TestDiffSnapshotsDetectsAndSortsChanges(t *testing.T) {
 	wantFields := []string{"sizeBytes", "modifiedUtc", "permissions"}
 	if !reflect.DeepEqual(gotFields, wantFields) {
 		t.Fatalf("Modified fields = %#v, want %#v", gotFields, wantFields)
+	}
+}
+
+func TestShouldSkipWalkErrorReturnsFalseForRegularFiles(t *testing.T) {
+	tempDir := t.TempDir()
+	filePath := filepath.Join(tempDir, "file.txt")
+	mustWriteFile(t, filePath, "hello")
+
+	if shouldSkipWalkError(filePath, errors.New("some other error")) {
+		t.Fatal("shouldSkipWalkError() = true, want false for non-skippable regular file error")
+	}
+}
+
+func TestIsSkippableAccessError(t *testing.T) {
+	tests := []error{
+		os.ErrPermission,
+		errors.New("open C:\\tmp: Access is denied."),
+		errors.New("open C:\\tmp: The file cannot be accessed by the system."),
+	}
+
+	for _, err := range tests {
+		if !isSkippableAccessError(err) {
+			t.Fatalf("isSkippableAccessError(%q) = false, want true", err.Error())
+		}
 	}
 }
 

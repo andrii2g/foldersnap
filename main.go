@@ -238,8 +238,15 @@ func createSnapshot(root string, excludes []string) (*SnapshotFile, error) {
 	snapshot.Snapshot.RootPath = absRoot
 	snapshot.Snapshot.PathStyle = "slash"
 
+	fmt.Fprintf(os.Stderr, "info: scanning %s\n", absRoot)
+	lastProgress := time.Now()
+
 	if err := filepath.WalkDir(absRoot, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
+			if shouldSkipWalkError(path, walkErr) {
+				fmt.Fprintf(os.Stderr, "warn: %v\n", walkErr)
+				return nil
+			}
 			return walkErr
 		}
 		if path == absRoot {
@@ -264,8 +271,6 @@ func createSnapshot(root string, excludes []string) (*SnapshotFile, error) {
 		}
 
 		entry := entryFromInfo(relPath, info)
-		snapshot.Entries = append(snapshot.Entries, entry)
-
 		switch entry.Type {
 		case "file":
 			snapshot.Snapshot.FileCount++
@@ -276,6 +281,19 @@ func createSnapshot(root string, excludes []string) (*SnapshotFile, error) {
 			snapshot.Snapshot.SymlinkCount++
 		default:
 			snapshot.Snapshot.OtherCount++
+		}
+		snapshot.Entries = append(snapshot.Entries, entry)
+		if time.Since(lastProgress) >= time.Second {
+			fmt.Fprintf(
+				os.Stderr,
+				"info: scanned %d entries (%d files, %d dirs, %d symlinks, %d other)\n",
+				len(snapshot.Entries),
+				snapshot.Snapshot.FileCount,
+				snapshot.Snapshot.DirectoryCount,
+				snapshot.Snapshot.SymlinkCount,
+				snapshot.Snapshot.OtherCount,
+			)
+			lastProgress = time.Now()
 		}
 
 		return nil
@@ -289,6 +307,12 @@ func createSnapshot(root string, excludes []string) (*SnapshotFile, error) {
 
 	snapshot.Snapshot.EntryCount = len(snapshot.Entries)
 	snapshot.Snapshot.DurationMs = time.Since(start).Milliseconds()
+	fmt.Fprintf(
+		os.Stderr,
+		"info: completed scan in %dms with %d entries\n",
+		snapshot.Snapshot.DurationMs,
+		snapshot.Snapshot.EntryCount,
+	)
 	return &snapshot, nil
 }
 
@@ -459,6 +483,40 @@ func newBaseSnapshot() SnapshotFile {
 		},
 		Entries: []Entry{},
 	}
+}
+
+func shouldSkipWalkError(path string, walkErr error) bool {
+	if isSkippableAccessError(walkErr) {
+		return true
+	}
+
+	if path == "" {
+		return false
+	}
+
+	info, err := os.Lstat(path)
+	if err != nil {
+		return hasReparsePointPath(path)
+	}
+
+	return isNonFollowedLink(info)
+}
+
+func isNonFollowedLink(info os.FileInfo) bool {
+	if info.Mode()&os.ModeSymlink != 0 {
+		return true
+	}
+	return hasReparsePoint(info)
+}
+
+func isSkippableAccessError(err error) bool {
+	if errors.Is(err, os.ErrPermission) {
+		return true
+	}
+
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "access is denied") ||
+		strings.Contains(message, "cannot be accessed by the system")
 }
 
 func validateSnapshot(snapshot *SnapshotFile) error {
